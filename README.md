@@ -29,10 +29,10 @@ Play these sequence with buttons if not recognized : Hold boot, clic reset, rele
 
 Control : 
 
-Oct - : Eiffel Tower 
-Oct + : Vine bottle 
-Volume - : Cloud 
-Volume + : Flower 
+Oct - : Eiffel Tower; 
+Oct + : Vine bottle; 
+Volume - : Cloud; 
+Volume + : Flower
 
 Sampler mode : Combo Eiffel + Vine bottle 
 Return to synth mode : Same combo 
