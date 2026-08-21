@@ -27,7 +27,7 @@ Play these sequence with buttons if not recognized : Hold boot, clic reset, rele
 
 *** To use midi function, please connect a data compatible usb C câble to the USB direct port ***
 
-#Control : 
+Control : 
 Oct - : Eiffel Tower 
 Oct + : Vine bottle 
 Volume - : Cloud 
