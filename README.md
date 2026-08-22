@@ -13,6 +13,8 @@ If too long, the WAVs are cut.
 
 How to upload code on Chili Pepper : 
 
+Install Adafruit_MPR121 library 
+
 Board name on Arduino : ESP32S3 Dev Module
 
 Upload profile (midi enabled) :
