@@ -59,7 +59,7 @@ namespace {
         strIndex,
         epOut,
         (uint8_t)(0x80 | epIn),
-        CFG_TUD_ENDOINT_SIZE
+        CFG_TUD_ENDPOINT_SIZE
       )
     };
 
