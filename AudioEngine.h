@@ -6,17 +6,19 @@ namespace Audio {
 
   // Four available internal synth engines.
   enum OscillatorEngine : uint8_t {
-    OSC_ENGINE_WORMY = 0,
-    OSC_ENGINE_LIGHT,
-    OSC_ENGINE_AURORA_LIGHT,
-    OSC_ENGINE_ORGAN,
+    OSC_ENGINE_STEEL_DRUM = 0,
+    OSC_ENGINE_VAPOR_FLUTE,
+    OSC_ENGINE_ACCORDION,
+    OSC_ENGINE_OMNICHORD,
     OSC_ENGINE_COUNT
   };
 
-  // Space effects add ambience after the dry engine signal.
+  // Post-engine effects applied after the dry voice mix.
   enum SpaceFxMode : uint8_t {
     SPACE_FX_OFF = 0,
     SPACE_FX_WARM_REVERB,
+    SPACE_FX_DRIVE,
+    SPACE_FX_ECHOLOOP,
     SPACE_FX_COUNT
   };
 

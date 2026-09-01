@@ -61,9 +61,9 @@
 //
 // Examples:
 //   "majC3", "minC3", "majF#2", "minBb4", "majA3"
-static constexpr const char* PANORYTHE_SCALE = "minC3";
+static constexpr const char* PANORYTHE_SCALE = "majR#3";
 
-// Two MPR121 touch controllers on separate I2C buses.
+// Two MPR121 touch controllers on separate I2C buses to ensure stable use.
 #define SDA_PIN                        8
 #define SCL_PIN                        9
 #define SDA2_PIN                       21

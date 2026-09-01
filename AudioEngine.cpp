@@ -34,6 +34,14 @@ constexpr uint8_t SAMPLE_PAD_COUNT = 10;
 constexpr uint8_t MAX_NOTE_INDEX = 24;
 constexpr uint8_t AUDIO_EVENT_QUEUE_LEN = 48;
 constexpr size_t SINE_TABLE_SIZE = 1024;
+constexpr uint32_t REVERB_A_SIZE = 2048u;
+constexpr uint32_t REVERB_B_SIZE = 4096u;
+constexpr uint32_t REVERB_A_MASK = REVERB_A_SIZE - 1u;
+constexpr uint32_t REVERB_B_MASK = REVERB_B_SIZE - 1u;
+constexpr uint32_t ECHOLOOP_BUFFER_SIZE = 32768u;
+constexpr uint32_t ECHOLOOP_BUFFER_MASK = ECHOLOOP_BUFFER_SIZE - 1u;
+constexpr uint8_t ECHOLOOP_VOICE_COUNT = 2;
+constexpr uint8_t ECHOLOOP_NOTE_HISTORY = 16;
 constexpr float OUTPUT_PCM_SCALE = 22000.0f;
 constexpr float PI_F = 3.14159265358979323846f;
 constexpr float TWO_PI_F = 6.28318530717958647692f;
@@ -51,15 +59,10 @@ static const char* SAMPLE_FILE_BASES[6] = {
   "cheese_pad"
 };
 
-static const float WORMY_FORMANTS[5][3] = {
-  {740.0f, 1180.0f, 2550.0f},
-  {500.0f, 1860.0f, 2500.0f},
-  {310.0f, 2220.0f, 2920.0f},
-  {510.0f,  880.0f, 2380.0f},
-  {360.0f,  720.0f, 2180.0f}
-};
-
-static const float WORMY_FORMANT_GAINS[3] = {0.85f, 0.58f, 0.32f};
+static const float FLUTE_AIR_FORMANTS[3] = {820.0f, 1680.0f, 3120.0f};
+static const float FLUTE_AIR_GAINS[3] = {0.050f, 0.032f, 0.018f};
+static const float ACCORDION_BODY_FORMANTS[3] = {290.0f, 760.0f, 1950.0f};
+static const float ACCORDION_BODY_GAINS[3] = {0.24f, 0.15f, 0.08f};
 
 enum EnvState : uint8_t {
   ENV_IDLE = 0,
@@ -105,7 +108,6 @@ struct Voice {
   float noiseEnv;
   uint32_t rng;
   uint32_t startedAt;
-  uint8_t vowelIndex;
   float formantCoeff[3];
   float formantDamping[3];
   FormantState formant[3];
@@ -128,13 +130,23 @@ struct SampleVoice {
   uint32_t startedAt;
 };
 
+struct EchoLoopVoice {
+  bool active;
+  uint16_t readIndex;
+  uint16_t remaining;
+  uint16_t length;
+  uint16_t fadeSamples;
+  float fadeScale;
+  float level;
+};
+
 // Global audio state. New notes use gEngine; existing voices keep their engine.
 static Voice gVoices[MAX_VOICES];
 static SampleVoice gSampleVoices[MAX_SAMPLE_VOICES];
 static SampleSlot gSampleSlots[SAMPLE_PAD_COUNT];
 static uint32_t gVoiceSeq = 1;
 static float gVolume = 0.70f;
-static OscillatorEngine gEngine = OSC_ENGINE_LIGHT;
+static OscillatorEngine gEngine = OSC_ENGINE_OMNICHORD;
 static volatile bool gSamplerModeRequested = false;
 static bool gSamplerMode = false;
 static bool gSampleSdReady = false;
@@ -150,10 +162,19 @@ static float gReverbAmount = 0.0f;
 static bool gI2sReady = false;
 static int16_t gOut[CHUNK_SAMPLES * 2];
 
-static float gReverbA[2048];
-static float gReverbB[3072];
-static uint16_t gReverbIndexA = 0;
-static uint16_t gReverbIndexB = 0;
+static float gReverbA[REVERB_A_SIZE];
+static float gReverbB[REVERB_B_SIZE];
+static uint32_t gReverbIndexA = 0;
+static uint32_t gReverbIndexB = 0;
+static int16_t gEchoLoopBuffer[ECHOLOOP_BUFFER_SIZE];
+static EchoLoopVoice gEchoLoopVoices[ECHOLOOP_VOICE_COUNT];
+static uint16_t gEchoLoopWriteIndex = 0;
+static uint16_t gEchoLoopCountdown = 0;
+static uint32_t gEchoLoopSampleCounter = 0;
+static uint32_t gEchoLoopNoteStarts[ECHOLOOP_NOTE_HISTORY];
+static uint8_t gEchoLoopNoteWrite = 0;
+static uint8_t gEchoLoopNoteCount = 0;
+static uint32_t gEchoLoopRng = 0xC0DEC0DEu;
 static StaticQueue_t gAudioEventQueueState;
 static uint8_t gAudioEventQueueStorage[AUDIO_EVENT_QUEUE_LEN * sizeof(AudioEvent)];
 static QueueHandle_t gAudioEventQueue = nullptr;
@@ -217,12 +238,12 @@ static inline float sine01(float phase) {
   return gSineTable[idx0] + (gSineTable[idx1] - gSineTable[idx0]) * frac;
 }
 
-// Cheap triangle wave used to add edge to the Light engine.
+// Cheap triangle wave used to add reed/string edge.
 static inline float triangle01(float phase) {
   return (phase < 0.5f) ? (phase * 4.0f - 1.0f) : (3.0f - phase * 4.0f);
 }
 
-// Small deterministic noise generator used by Aurora Light and Wormy.
+// Small deterministic noise generator used by breath and strike transients.
 static uint32_t xorshift(uint32_t& state) {
   uint32_t x = state ? state : 0x9E3779B9u;
   x ^= x << 13;
@@ -235,6 +256,11 @@ static uint32_t xorshift(uint32_t& state) {
 // Convert xorshift output to a bipolar floating-point noise signal.
 static inline float whiteNoise(uint32_t& state) {
   return ((int32_t)xorshift(state)) / 2147483648.0f;
+}
+
+static uint32_t randomRange(uint32_t& state, uint32_t maxExclusive) {
+  if (maxExclusive == 0) return 0;
+  return xorshift(state) % maxExclusive;
 }
 
 // Standard equal-tempered MIDI note conversion.
@@ -953,25 +979,25 @@ static int scaleStepForPad(uint8_t noteIndex) {
   return gScaleMinor ? minorSteps[idx] : majorSteps[idx];
 }
 
-// Engine-specific attack times keep plucked sounds quick and vocal sounds softer.
+// Engine-specific attack times keep percussive sounds quick and breath/reed sounds playable.
 static float attackSecondsFor(OscillatorEngine engine) {
   switch (engine) {
-    case OSC_ENGINE_WORMY: return 0.030f;
-    case OSC_ENGINE_AURORA_LIGHT: return 0.004f;
-    case OSC_ENGINE_ORGAN: return 0.012f;
-    case OSC_ENGINE_LIGHT:
-    default: return 0.014f;
+    case OSC_ENGINE_STEEL_DRUM: return 0.002f;
+    case OSC_ENGINE_VAPOR_FLUTE: return 0.135f;
+    case OSC_ENGINE_ACCORDION: return 0.038f;
+    case OSC_ENGINE_OMNICHORD:
+    default: return 0.018f;
   }
 }
 
 // Engine-specific release times define each sound tail.
 static float releaseSecondsFor(OscillatorEngine engine) {
   switch (engine) {
-    case OSC_ENGINE_WORMY: return 0.34f;
-    case OSC_ENGINE_AURORA_LIGHT: return 1.45f;
-    case OSC_ENGINE_ORGAN: return 0.26f;
-    case OSC_ENGINE_LIGHT:
-    default: return 0.42f;
+    case OSC_ENGINE_STEEL_DRUM: return 0.18f;
+    case OSC_ENGINE_VAPOR_FLUTE: return 1.55f;
+    case OSC_ENGINE_ACCORDION: return 0.32f;
+    case OSC_ENGINE_OMNICHORD:
+    default: return 1.05f;
   }
 }
 
@@ -1000,6 +1026,37 @@ static void clearAllSynthVoices() {
 static void clearAllSampleVoices() {
   for (uint8_t i = 0; i < MAX_SAMPLE_VOICES; ++i) {
     clearSampleVoice(gSampleVoices[i]);
+  }
+}
+
+static void resetReverbState() {
+  memset(gReverbA, 0, sizeof(gReverbA));
+  memset(gReverbB, 0, sizeof(gReverbB));
+  gReverbIndexA = 0;
+  gReverbIndexB = 0;
+}
+
+static void resetEchoLoopPlayback() {
+  memset(gEchoLoopVoices, 0, sizeof(gEchoLoopVoices));
+  gEchoLoopCountdown = 0;
+  gEchoLoopRng ^= gEchoLoopSampleCounter + 0x9E3779B9u;
+}
+
+static void resetEchoLoopHistory() {
+  memset(gEchoLoopBuffer, 0, sizeof(gEchoLoopBuffer));
+  memset(gEchoLoopNoteStarts, 0, sizeof(gEchoLoopNoteStarts));
+  gEchoLoopWriteIndex = 0;
+  gEchoLoopSampleCounter = 0;
+  gEchoLoopNoteWrite = 0;
+  gEchoLoopNoteCount = 0;
+  resetEchoLoopPlayback();
+}
+
+static void rememberEchoLoopNoteStart() {
+  gEchoLoopNoteStarts[gEchoLoopNoteWrite] = gEchoLoopSampleCounter;
+  gEchoLoopNoteWrite = (uint8_t)((gEchoLoopNoteWrite + 1u) % ECHOLOOP_NOTE_HISTORY);
+  if (gEchoLoopNoteCount < ECHOLOOP_NOTE_HISTORY) {
+    gEchoLoopNoteCount++;
   }
 }
 
@@ -1037,6 +1094,19 @@ static int allocateSampleVoice() {
   return oldest;
 }
 
+static void configureBodyResonators(Voice& v,
+                                    const float* frequencies,
+                                    float dampingBase,
+                                    float dampingStep) {
+  if (!frequencies) return;
+
+  for (uint8_t i = 0; i < 3; ++i) {
+    float hz = clampf(frequencies[i], 40.0f, 8000.0f);
+    v.formantCoeff[i] = 2.0f * sinf(PI_F * hz / (float)SAMPLE_RATE);
+    v.formantDamping[i] = dampingBase + dampingStep * (float)i;
+  }
+}
+
 // Initialize all per-voice state for a new note.
 static void configureVoice(Voice& v, uint8_t noteIndex) {
   clearVoice(v);
@@ -1055,15 +1125,16 @@ static void configureVoice(Voice& v, uint8_t noteIndex) {
   v.noiseEnv = 1.0f;
   v.rng = 0xA341316Cu ^ ((uint32_t)noteIndex * 0x45D9F3Bu) ^ gVoiceSeq;
   v.startedAt = gVoiceSeq++;
-  v.vowelIndex = (uint8_t)(noteIndex % 5);
 
-  float shift = 0.90f + 0.035f * (float)(v.noteIndex % 7);
-  uint8_t vowel = v.vowelIndex;
-  if (vowel > 4) vowel = 0;
-  for (uint8_t i = 0; i < 3; ++i) {
-    float hz = clampf(WORMY_FORMANTS[vowel][i] * shift, 40.0f, 8000.0f);
-    v.formantCoeff[i] = 2.0f * sinf(PI_F * hz / (float)SAMPLE_RATE);
-    v.formantDamping[i] = 0.10f + 0.025f * (float)i;
+  switch (v.engine) {
+    case OSC_ENGINE_VAPOR_FLUTE:
+      configureBodyResonators(v, FLUTE_AIR_FORMANTS, 0.18f, 0.045f);
+      break;
+    case OSC_ENGINE_ACCORDION:
+      configureBodyResonators(v, ACCORDION_BODY_FORMANTS, 0.10f, 0.030f);
+      break;
+    default:
+      break;
   }
 }
 
@@ -1090,47 +1161,6 @@ static void updateEnvelope(Voice& v) {
   }
 }
 
-// Light: smooth dual-oscillator tone with a filtered edge component.
-static float renderLight(Voice& v) {
-  float inc = v.freq / (float)SAMPLE_RATE;
-  float incB = (v.freq * 1.006f) / (float)SAMPLE_RATE;
-  v.phaseA = wrap01(v.phaseA + inc);
-  v.phaseB = wrap01(v.phaseB + incB);
-  float body = 0.58f * sine01(v.phaseA) + 0.28f * sine01(v.phaseB);
-  float edge = 0.18f * triangle01(v.phaseA);
-  v.lp += (body + edge - v.lp) * 0.055f;
-  return v.lp * 0.85f;
-}
-
-// Aurora Light: bell-like pluck with decaying harmonics and a small noise strike.
-static float renderAuroraLight(Voice& v) {
-  float inc = v.freq / (float)SAMPLE_RATE;
-  v.phaseA = wrap01(v.phaseA + inc);
-  v.phaseB = wrap01(v.phaseB + inc * 2.006f);
-  v.phaseC = wrap01(v.phaseC + inc * 3.014f);
-  v.pluckEnv *= 0.99935f;
-  v.noiseEnv *= 0.9965f;
-  float bell = sine01(v.phaseA) * 0.52f;
-  bell += sine01(v.phaseB) * (0.38f * v.pluckEnv);
-  bell += sine01(v.phaseC) * (0.20f * v.pluckEnv);
-  bell += whiteNoise(v.rng) * (0.045f * v.noiseEnv);
-  return bell * 0.95f;
-}
-
-// Organ: additive drawbar-style tone with soft saturation.
-static float renderOrgan(Voice& v) {
-  float inc = v.freq / (float)SAMPLE_RATE;
-  v.phaseA = wrap01(v.phaseA + inc);
-  v.phaseB = wrap01(v.phaseB + inc * 2.0f);
-  v.phaseC = wrap01(v.phaseC + inc * 3.0f);
-  v.phaseD = wrap01(v.phaseD + inc * 4.0f);
-  float s = 0.62f * sine01(v.phaseA);
-  s += 0.23f * sine01(v.phaseB);
-  s += 0.14f * sine01(v.phaseC);
-  s += 0.08f * sine01(v.phaseD);
-  return fastTanh(s * 1.15f) * 0.82f;
-}
-
 // Process one state-variable band-pass formant stage.
 static float processFormant(FormantState& st, float input, float coeff, float damping) {
   float high = input - st.low - damping * st.band;
@@ -1139,24 +1169,117 @@ static float processFormant(FormantState& st, float input, float coeff, float da
   return st.band;
 }
 
-// Wormy: compact vocal engine built from one glottal source and three formants.
-static float renderWormy(Voice& v) {
+// Steel drum: fast mallet strike, inharmonic partials, and an automatic tail.
+static float renderSteelDrum(Voice& v) {
   float inc = v.freq / (float)SAMPLE_RATE;
   v.phaseA = wrap01(v.phaseA + inc);
-  v.phaseB = wrap01(v.phaseB + inc * 0.50f);
-  float glottal = (v.phaseA < 0.42f) ? 0.92f : -0.58f;
-  glottal += 0.18f * sine01(v.phaseA);
-  glottal += 0.05f * whiteNoise(v.rng);
+  v.phaseB = wrap01(v.phaseB + inc * 2.012f);
+  v.phaseC = wrap01(v.phaseC + inc * 3.874f);
+  v.phaseD = wrap01(v.phaseD + inc * 5.392f);
 
-  float out = 0.0f;
-  for (uint8_t i = 0; i < 3; ++i) {
-    out += WORMY_FORMANT_GAINS[i] * processFormant(v.formant[i],
-                                                   glottal,
-                                                   v.formantCoeff[i],
-                                                   v.formantDamping[i]);
+  v.pluckEnv *= 0.99983f;
+  v.noiseEnv *= 0.9925f;
+
+  float bright = v.pluckEnv * v.pluckEnv;
+  float s = 0.58f * sine01(v.phaseA);
+  s += bright * (0.34f * sine01(v.phaseB) +
+                 0.23f * sine01(v.phaseC) +
+                 0.13f * sine01(v.phaseD));
+  s *= v.pluckEnv;
+  s += whiteNoise(v.rng) * (0.055f * v.noiseEnv);
+
+  v.lp += (s - v.lp) * 0.22f;
+  if (v.pluckEnv < 0.00045f && v.noiseEnv < 0.00045f) {
+    clearVoice(v);
   }
-  out += 0.10f * sine01(v.phaseB);
-  return fastTanh(out * 1.7f) * 0.72f;
+  return fastTanh((s * 0.78f + v.lp * 0.22f) * 1.35f) * 1.02f;
+}
+
+// Vapor flute: soft sine body with breath noise through lightweight resonators.
+static float renderVaporFlute(Voice& v) {
+  float inc = v.freq / (float)SAMPLE_RATE;
+  v.phaseC = wrap01(v.phaseC + 0.19f / (float)SAMPLE_RATE);
+  v.phaseD = wrap01(v.phaseD + 5.15f / (float)SAMPLE_RATE);
+
+  float vibrato = sine01(v.phaseD) * 0.0038f;
+  float pitchInc = inc * (1.0f + vibrato);
+  v.phaseA = wrap01(v.phaseA + pitchInc);
+  v.phaseB = wrap01(v.phaseB + pitchInc * 2.003f);
+
+  v.noiseEnv += (0.22f - v.noiseEnv) * 0.00035f;
+  float noise = whiteNoise(v.rng);
+  v.lp += (noise - v.lp) * 0.020f;
+  float air = noise - v.lp;
+
+  float resonantAir = 0.0f;
+  for (uint8_t i = 0; i < 3; ++i) {
+    resonantAir += FLUTE_AIR_GAINS[i] * processFormant(v.formant[i],
+                                                       air,
+                                                       v.formantCoeff[i],
+                                                       v.formantDamping[i]);
+  }
+
+  float movement = 0.92f + 0.08f * sine01(v.phaseC);
+  float tone = 0.72f * sine01(v.phaseA) + 0.12f * sine01(v.phaseB);
+  tone *= movement;
+  tone += resonantAir * (0.52f + v.noiseEnv);
+  return fastTanh(tone * 0.95f) * 0.72f;
+}
+
+// Accordion: detuned free reeds with box resonances and a short key transient.
+static float renderAccordion(Voice& v) {
+  float inc = v.freq / (float)SAMPLE_RATE;
+  v.phaseA = wrap01(v.phaseA + inc * 0.9965f);
+  v.phaseB = wrap01(v.phaseB + inc * 1.0045f);
+  v.phaseC = wrap01(v.phaseC + inc * 2.000f);
+  v.phaseD = wrap01(v.phaseD + inc * 3.000f);
+
+  v.noiseEnv *= 0.9950f;
+  float reed = 0.39f * sine01(v.phaseA);
+  reed += 0.39f * sine01(v.phaseB);
+  reed += 0.14f * triangle01(v.phaseA);
+  reed += 0.11f * triangle01(v.phaseB);
+  reed += 0.13f * sine01(v.phaseC);
+  reed += 0.055f * sine01(v.phaseD);
+
+  float body = 0.0f;
+  for (uint8_t i = 0; i < 3; ++i) {
+    body += ACCORDION_BODY_GAINS[i] * processFormant(v.formant[i],
+                                                     reed,
+                                                     v.formantCoeff[i],
+                                                     v.formantDamping[i]);
+  }
+  v.lp += (reed - v.lp) * 0.085f;
+
+  float keyNoise = whiteNoise(v.rng) * (0.015f * v.noiseEnv);
+  float s = reed * 0.68f + body + v.lp * 0.22f + keyNoise;
+  return fastTanh(s * 1.25f) * 0.78f;
+}
+
+// Omnichord: chorused chord-machine voice with a slow internal shimmer.
+static float renderOmnichord(Voice& v) {
+  float inc = v.freq / (float)SAMPLE_RATE;
+  v.phaseD = wrap01(v.phaseD + 0.32f / (float)SAMPLE_RATE);
+  float move = sine01(v.phaseD);
+  float shimmer = sine01(v.phaseD + 0.25f);
+
+  v.phaseA = wrap01(v.phaseA + inc * (0.9985f + 0.0010f * move));
+  v.phaseB = wrap01(v.phaseB + inc * 2.002f);
+  v.phaseC = wrap01(v.phaseC + inc * 1.498f);
+
+  v.pluckEnv += (0.38f - v.pluckEnv) * 0.00018f;
+
+  float chord = 0.42f * triangle01(v.phaseA);
+  chord += 0.28f * sine01(v.phaseB);
+  chord += (0.17f + 0.045f * shimmer) * sine01(v.phaseC);
+  chord += 0.08f * triangle01(v.phaseB);
+
+  float filterStep = 0.032f + 0.022f * (0.5f + 0.5f * move);
+  v.lp += (chord - v.lp) * filterStep;
+
+  float pulse = 0.86f + 0.10f * shimmer;
+  float pick = 0.82f + 0.18f * v.pluckEnv;
+  return fastTanh((v.lp * 0.64f + chord * 0.36f) * 1.05f) * pulse * pick * 0.82f;
 }
 
 // Render one voice sample after envelope processing.
@@ -1166,18 +1289,18 @@ static float renderVoice(Voice& v) {
 
   float s = 0.0f;
   switch (v.engine) {
-    case OSC_ENGINE_WORMY:
-      s = renderWormy(v);
+    case OSC_ENGINE_STEEL_DRUM:
+      s = renderSteelDrum(v);
       break;
-    case OSC_ENGINE_AURORA_LIGHT:
-      s = renderAuroraLight(v);
+    case OSC_ENGINE_VAPOR_FLUTE:
+      s = renderVaporFlute(v);
       break;
-    case OSC_ENGINE_ORGAN:
-      s = renderOrgan(v);
+    case OSC_ENGINE_ACCORDION:
+      s = renderAccordion(v);
       break;
-    case OSC_ENGINE_LIGHT:
+    case OSC_ENGINE_OMNICHORD:
     default:
-      s = renderLight(v);
+      s = renderOmnichord(v);
       break;
   }
   return s * v.env;
@@ -1213,25 +1336,160 @@ static float renderSampleVoice(SampleVoice& v) {
   return s * 0.95f;
 }
 
-// Warm reverb: two feedback delay lines with modest damping.
-static float processReverb(float x) {
-  if (gSpaceFxMode != SPACE_FX_WARM_REVERB || gReverbAmount <= 0.001f) {
-    return x;
+static inline uint16_t echoLoopIndex(uint32_t sampleIndex) {
+  return (uint16_t)(sampleIndex & ECHOLOOP_BUFFER_MASK);
+}
+
+static void writeEchoLoopHistory(float x) {
+  float sample = clampf(finiteOrZero(x), -1.0f, 1.0f);
+  gEchoLoopBuffer[gEchoLoopWriteIndex] = (int16_t)(sample * 32767.0f);
+  gEchoLoopWriteIndex = echoLoopIndex((uint32_t)gEchoLoopWriteIndex + 1u);
+  gEchoLoopSampleCounter++;
+}
+
+static int allocateEchoLoopVoice() {
+  for (uint8_t i = 0; i < ECHOLOOP_VOICE_COUNT; ++i) {
+    if (!gEchoLoopVoices[i].active) return i;
+  }
+  return -1;
+}
+
+static void scheduleNextEchoLoopGrain(bool fastRetry) {
+  uint32_t base = fastRetry ? 700u : 1800u;
+  uint32_t span = fastRetry ? 1800u : 8500u;
+  gEchoLoopCountdown = (uint16_t)(base + randomRange(gEchoLoopRng, span));
+}
+
+static bool chooseEchoLoopReadIndex(uint16_t length, uint16_t& readIndex) {
+  uint32_t available = gEchoLoopSampleCounter;
+  if (available > ECHOLOOP_BUFFER_SIZE) available = ECHOLOOP_BUFFER_SIZE;
+  if (available <= (uint32_t)length + 512u) return false;
+
+  if (gEchoLoopNoteCount > 0) {
+    for (uint8_t attempt = 0; attempt < 8; ++attempt) {
+      uint8_t idx = (uint8_t)randomRange(gEchoLoopRng, gEchoLoopNoteCount);
+      uint32_t startSample = gEchoLoopNoteStarts[idx];
+      uint32_t age = gEchoLoopSampleCounter - startSample;
+      if (age <= (uint32_t)length + 512u ||
+          age >= ECHOLOOP_BUFFER_SIZE - 256u ||
+          age > available) {
+        continue;
+      }
+
+      uint32_t maxJitter = age - (uint32_t)length - 256u;
+      if (maxJitter > 1800u) maxJitter = 1800u;
+      readIndex = echoLoopIndex(startSample + randomRange(gEchoLoopRng, maxJitter));
+      return true;
+    }
   }
 
-  float amount = clamp01(gReverbAmount);
-  float input = fastTanh(finiteOrZero(x) * 0.90f) * 0.85f;
+  uint32_t maxDelay = available - 256u;
+  if (maxDelay <= (uint32_t)length + 256u) return false;
+  uint32_t span = maxDelay - (uint32_t)length - 256u;
+  uint32_t delay = (uint32_t)length + 256u + randomRange(gEchoLoopRng, span);
+  readIndex = echoLoopIndex(gEchoLoopSampleCounter - delay);
+  return true;
+}
+
+static bool startEchoLoopGrain() {
+  int slot = allocateEchoLoopVoice();
+  if (slot < 0) return false;
+
+  uint16_t length = (uint16_t)(1900u + randomRange(gEchoLoopRng, 6400u));
+  uint16_t readIndex = 0;
+  if (!chooseEchoLoopReadIndex(length, readIndex)) return false;
+
+  uint16_t fadeSamples = (uint16_t)(length / 6u);
+  if (fadeSamples < 192u) fadeSamples = 192u;
+  if (fadeSamples > 768u) fadeSamples = 768u;
+
+  EchoLoopVoice& voice = gEchoLoopVoices[slot];
+  voice.active = true;
+  voice.readIndex = readIndex;
+  voice.remaining = length;
+  voice.length = length;
+  voice.fadeSamples = fadeSamples;
+  voice.fadeScale = 1.0f / (float)fadeSamples;
+  voice.level = 0.34f + 0.16f * ((float)randomRange(gEchoLoopRng, 256u) / 255.0f);
+  return true;
+}
+
+// Lighter warm reverb: no integer modulo or nested saturators in the sample path.
+static float processReverb(float x) {
+  if (gReverbAmount <= 0.001f) return x;
+
+  float amount = gReverbAmount;
+  float input = finiteOrZero(x) * 0.72f;
   float a = gReverbA[gReverbIndexA];
   float b = gReverbB[gReverbIndexB];
-  float wet = fastTanh(0.58f * a + 0.42f * b);
-  float feedback = 0.36f + 0.18f * amount;
-  gReverbA[gReverbIndexA] = fastTanh(input + b * feedback);
-  gReverbB[gReverbIndexB] = fastTanh(input * 0.70f + a * (feedback * 0.82f));
+  float wet = 0.58f * a + 0.43f * b;
+  float feedback = 0.48f + 0.18f * amount;
 
-  gReverbIndexA = (uint16_t)((gReverbIndexA + 1u) % 2048u);
-  gReverbIndexB = (uint16_t)((gReverbIndexB + 1u) % 3072u);
+  gReverbA[gReverbIndexA] = clampf(input + b * feedback, -1.2f, 1.2f);
+  gReverbB[gReverbIndexB] = clampf(input * 0.64f + a * (feedback * 0.84f), -1.2f, 1.2f);
 
-  return x * (1.0f - amount * 0.30f) + wet * (amount * 0.50f);
+  gReverbIndexA = (gReverbIndexA + 1u) & REVERB_A_MASK;
+  gReverbIndexB = (gReverbIndexB + 1u) & REVERB_B_MASK;
+
+  return x * (1.0f - amount * 0.16f) + wet * (amount * 0.70f);
+}
+
+// Aggressive distortion with fixed output compensation before the final limiter.
+static float processDrive(float x) {
+  float input = finiteOrZero(x);
+  float stageA = fastTanh(input * 8.5f);
+  float stageB = fastTanh((stageA * 1.55f + input * 0.42f) * 2.7f);
+  float out = stageB * 0.52f + stageA * 0.11f + input * 0.05f;
+  return clampf(finiteOrZero(out), -0.72f, 0.72f);
+}
+
+// Random micro-loop echo from recent audio note starts and short history grains.
+static float processEchoLoop(float x) {
+  if (gEchoLoopCountdown > 0) {
+    gEchoLoopCountdown--;
+  } else {
+    bool started = startEchoLoopGrain();
+    scheduleNextEchoLoopGrain(!started);
+  }
+
+  float wet = 0.0f;
+  for (uint8_t i = 0; i < ECHOLOOP_VOICE_COUNT; ++i) {
+    EchoLoopVoice& voice = gEchoLoopVoices[i];
+    if (!voice.active) continue;
+
+    uint16_t played = (uint16_t)(voice.length - voice.remaining);
+    float env = 1.0f;
+    if (played < voice.fadeSamples) {
+      env = (float)(played + 1u) * voice.fadeScale;
+    }
+    if (voice.remaining < voice.fadeSamples) {
+      float tail = (float)voice.remaining * voice.fadeScale;
+      if (tail < env) env = tail;
+    }
+
+    wet += ((float)gEchoLoopBuffer[voice.readIndex] / 32768.0f) * env * voice.level;
+    voice.readIndex = echoLoopIndex((uint32_t)voice.readIndex + 1u);
+    if (voice.remaining > 0) voice.remaining--;
+    if (voice.remaining == 0) voice.active = false;
+  }
+
+  return clampf(x * 0.78f + wet * 0.86f, -1.2f, 1.2f);
+}
+
+static float processSpaceFx(float x) {
+  writeEchoLoopHistory(x);
+
+  switch (gSpaceFxMode) {
+    case SPACE_FX_WARM_REVERB:
+      return processReverb(x);
+    case SPACE_FX_DRIVE:
+      return processDrive(x);
+    case SPACE_FX_ECHOLOOP:
+      return processEchoLoop(x);
+    case SPACE_FX_OFF:
+    default:
+      return x;
+  }
 }
 
 // Final soft limiter before converting to 16-bit PCM.
@@ -1311,7 +1569,7 @@ static void renderChunk() {
     }
     mix *= polyTrim;
     mix = softLimit(mix);
-    mix = processReverb(mix);
+    mix = processSpaceFx(mix);
     mix = softLimit(mix * gVolume);
 
     float pcm = finiteOrZero(mix) * OUTPUT_PCM_SCALE;
@@ -1327,6 +1585,8 @@ static void startQueuedSample(uint8_t noteIndex) {
   if (noteIndex >= SAMPLE_PAD_COUNT) return;
   SampleSlot& sample = gSampleSlots[noteIndex];
   if (!sample.loaded || !sample.data || sample.frames == 0) return;
+
+  rememberEchoLoopNoteStart();
 
   int slot = allocateSampleVoice();
   SampleVoice& v = gSampleVoices[slot];
@@ -1352,6 +1612,7 @@ static void startQueuedNote(uint8_t noteIndex) {
     startQueuedSample(noteIndex);
     return;
   }
+  rememberEchoLoopNoteStart();
   int slot = allocateVoice();
   configureVoice(gVoices[slot], noteIndex);
 }
@@ -1447,10 +1708,8 @@ void init() {
   ensureSampleBuffers();
   ensureSampleStorage();
 
-  memset(gReverbA, 0, sizeof(gReverbA));
-  memset(gReverbB, 0, sizeof(gReverbB));
-  gReverbIndexA = 0;
-  gReverbIndexB = 0;
+  resetReverbState();
+  resetEchoLoopHistory();
   i2sInit();
   Serial.println("[Audio] engine ready");
 }
@@ -1539,7 +1798,7 @@ void setVolume(float vol) {
 
 // Select the engine used by subsequent note-ons.
 void setOscillatorEngine(OscillatorEngine engine) {
-  if (engine >= OSC_ENGINE_COUNT) engine = OSC_ENGINE_LIGHT;
+  if (engine >= OSC_ENGINE_COUNT) engine = OSC_ENGINE_OMNICHORD;
   gEngine = engine;
 }
 
@@ -1556,6 +1815,12 @@ bool computeAllowsOscillatorEngine(OscillatorEngine engine) {
 // Select the active space effect.
 void setSpaceFxMode(SpaceFxMode mode) {
   if (mode >= SPACE_FX_COUNT) mode = SPACE_FX_OFF;
+  if (mode == gSpaceFxMode) return;
+
+  if (mode == SPACE_FX_WARM_REVERB) {
+    resetReverbState();
+  }
+  resetEchoLoopPlayback();
   gSpaceFxMode = mode;
 }
 
@@ -1578,6 +1843,8 @@ float getReverbAmount() {
 void clearAllEffects() {
   gSpaceFxMode = SPACE_FX_OFF;
   gReverbAmount = 0.0f;
+  resetReverbState();
+  resetEchoLoopPlayback();
 }
 
 // Shift the pad map by whole octaves.

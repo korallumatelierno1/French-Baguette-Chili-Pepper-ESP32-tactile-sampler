@@ -108,10 +108,10 @@ namespace Input {
   };
 
   static const EngineItem HEADLESS_ENGINES[] = {
-    {Audio::OSC_ENGINE_WORMY,       "Wormy"},
-    {Audio::OSC_ENGINE_LIGHT,       "Light"},
-    {Audio::OSC_ENGINE_AURORA_LIGHT, "Aurora Light"},
-    {Audio::OSC_ENGINE_ORGAN,       "Organ"}
+    {Audio::OSC_ENGINE_STEEL_DRUM,  "Steel Drum"},
+    {Audio::OSC_ENGINE_VAPOR_FLUTE, "Vapor Flute"},
+    {Audio::OSC_ENGINE_ACCORDION,   "Accordion"},
+    {Audio::OSC_ENGINE_OMNICHORD,   "Omnichord"}
   };
   static const int HEADLESS_ENGINE_COUNT =
     (int)(sizeof(HEADLESS_ENGINES) / sizeof(HEADLESS_ENGINES[0]));
@@ -133,8 +133,8 @@ namespace Input {
   static uint32_t gIrqFallbackLastMs = 0;
   static uint32_t gIrqMissLogMs = 0;
 
-  static uint8_t  gFxStage = 0; // 0: off, 1: reverb.
-  static int      gCurrentEngineIndex = 1;
+  static uint8_t  gFxStage = 0; // 0: off, 1: reverb, 2: drive, 3: echoloop.
+  static int      gCurrentEngineIndex = 3;
 
   // Control pads are filtered so one strong control press does not trigger neighbors.
   static bool     gControlGroupActive = false;
@@ -340,20 +340,30 @@ namespace Input {
 
   // Apply one of the headless FX states.
   static void applyHeadlessFxStage(uint8_t stage) {
-    if (stage == 1) {
-      Audio::clearAllEffects();
-      Audio::setSpaceFxMode(Audio::SPACE_FX_WARM_REVERB);
-      Audio::setReverbAmount(1.0f);
-      UI::showToast("FX: Reverb");
-    } else {
-      Audio::clearAllEffects();
-      UI::showToast("FX: Off");
+    Audio::clearAllEffects();
+    switch (stage) {
+      case 1:
+        Audio::setSpaceFxMode(Audio::SPACE_FX_WARM_REVERB);
+        Audio::setReverbAmount(0.78f);
+        UI::showToast("FX: Reverb");
+        break;
+      case 2:
+        Audio::setSpaceFxMode(Audio::SPACE_FX_DRIVE);
+        UI::showToast("FX: drive");
+        break;
+      case 3:
+        Audio::setSpaceFxMode(Audio::SPACE_FX_ECHOLOOP);
+        UI::showToast("FX: echoloop");
+        break;
+      default:
+        UI::showToast("FX: Off");
+        break;
     }
   }
 
-  // Cycle through off and reverb.
+  // Cycle through off, reverb, drive, and echoloop.
   static void cycleFxPad() {
-    gFxStage = (uint8_t)((gFxStage + 1u) % 2u);
+    gFxStage = (uint8_t)((gFxStage + 1u) % 4u);
     applyHeadlessFxStage(gFxStage);
   }
 
