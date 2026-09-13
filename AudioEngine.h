@@ -19,6 +19,7 @@ namespace Audio {
     SPACE_FX_WARM_REVERB,
     SPACE_FX_DRIVE,
     SPACE_FX_ECHOLOOP,
+    SPACE_FX_MIETTES,
     SPACE_FX_COUNT
   };
 
@@ -57,6 +58,9 @@ namespace Audio {
 
   // Disable every effect in one call.
   void clearAllEffects();
+
+  // Cycle distinct pitch classes, preserving mode and octave; wraps at either end.
+  void nudgeScale(int direction);
 
   // Runtime octave transpose added on top of PANORYTHE_SCALE.
   void setScaleOctaveOffset(int offset);

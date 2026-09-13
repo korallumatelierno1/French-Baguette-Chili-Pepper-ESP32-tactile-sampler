@@ -4,11 +4,13 @@
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <atomic>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "Config.h"
+#include "GranularFx.h"
 #include "Logger.h"
 #include "driver/i2s.h"
 #include "esp_heap_caps.h"
@@ -28,7 +30,10 @@ constexpr uint32_t SAMPLE_RATE = 44100;
 constexpr size_t CHUNK_SAMPLES = 128;
 constexpr uint16_t I2S_DMA_BUF_COUNT = 2;
 constexpr uint16_t I2S_DMA_BUF_LEN = 256;
-constexpr uint8_t MAX_VOICES = 6;
+constexpr uint8_t MAX_VOICES = SYNTH_POLYPHONY;
+static_assert(MAX_VOICES >= 1 && MAX_VOICES <= 24, "SYNTH_POLYPHONY must be 1..24");
+static_assert(SYNTH_VOICE_STEAL_FADE_MS > 0, "Voice steal fade must be positive");
+constexpr uint32_t STEAL_SAMPLES = SAMPLE_RATE * SYNTH_VOICE_STEAL_FADE_MS / 1000u;
 constexpr uint8_t MAX_SAMPLE_VOICES = 10;
 constexpr uint8_t SAMPLE_PAD_COUNT = 10;
 constexpr uint8_t MAX_NOTE_INDEX = 24;
@@ -142,6 +147,8 @@ struct EchoLoopVoice {
 
 // Global audio state. New notes use gEngine; existing voices keep their engine.
 static Voice gVoices[MAX_VOICES];
+static Voice gPendingVoices[MAX_VOICES];
+static uint32_t gStealRemaining[MAX_VOICES];
 static SampleVoice gSampleVoices[MAX_SAMPLE_VOICES];
 static SampleSlot gSampleSlots[SAMPLE_PAD_COUNT];
 static uint32_t gVoiceSeq = 1;
@@ -157,9 +164,26 @@ static uint32_t gSampleStorageRetryMs = 0;
 static bool gScaleMinor = true;
 static int gScaleBaseMidiNote = 48;
 static int gScaleOctaveOffset = 0;
+struct ScaleRoot { const char* name; uint8_t semitone; };
+// One spelling per pitch class so every combo changes the sounding key.
+// PANORYTHE_SCALE still accepts enharmonic spellings such as Db or Eb.
+static const ScaleRoot SCALE_ROOTS[] = {
+  {"C", 0}, {"C#", 1}, {"D", 2}, {"D#", 3}, {"E", 4}, {"F", 5},
+  {"F#", 6}, {"G", 7}, {"G#", 8}, {"A", 9}, {"A#", 10}, {"B", 11}
+};
+static constexpr int SCALE_ROOT_COUNT = sizeof(SCALE_ROOTS) / sizeof(SCALE_ROOTS[0]);
+static int gScaleRootIndex = 0;
+
 static SpaceFxMode gSpaceFxMode = SPACE_FX_OFF;
+// Input controls publish requests; only the audio task changes effect buffers.
+static std::atomic<SpaceFxMode> gSpaceFxModeRequested{SPACE_FX_OFF};
+static SpaceFxMode gNextSpaceFxMode = SPACE_FX_OFF;
+static float gSpaceFxBlend = 0.0f;
+constexpr float SPACE_FX_BLEND_STEP = 1.0f / (0.020f * SAMPLE_RATE);
 static float gReverbAmount = 0.0f;
+static std::atomic<float> gReverbAmountRequested{0.0f};
 static bool gI2sReady = false;
+static std::atomic<uint32_t> gRenderPeakUs{0};
 static int16_t gOut[CHUNK_SAMPLES * 2];
 
 static float gReverbA[REVERB_A_SIZE];
@@ -959,6 +983,7 @@ static void configureScaleFromCode() {
 
   gScaleMinor = minor;
   gScaleBaseMidiNote = baseMidi;
+  gScaleRootIndex = baseMidi % SCALE_ROOT_COUNT;
   Serial.printf("[Audio] scale %s, base MIDI note %d\n",
                 gScaleMinor ? "minor" : "major",
                 gScaleBaseMidiNote);
@@ -1020,6 +1045,8 @@ static void clearSampleVoice(SampleVoice& v) {
 static void clearAllSynthVoices() {
   for (uint8_t i = 0; i < MAX_VOICES; ++i) {
     clearVoice(gVoices[i]);
+    clearVoice(gPendingVoices[i]);
+    gStealRemaining[i] = 0;
   }
 }
 
@@ -1052,6 +1079,23 @@ static void resetEchoLoopHistory() {
   resetEchoLoopPlayback();
 }
 
+// Change algorithms only after fading to dry, at an audio block boundary.
+static void serviceSpaceFxRequest() {
+  gNextSpaceFxMode = gSpaceFxModeRequested.load(std::memory_order_relaxed);
+  // Preserve the old reverb level while its output fades away.
+  if (gNextSpaceFxMode == gSpaceFxMode || gNextSpaceFxMode == SPACE_FX_WARM_REVERB) {
+    gReverbAmount = gReverbAmountRequested.load(std::memory_order_relaxed);
+  }
+  if (gNextSpaceFxMode == gSpaceFxMode || gSpaceFxBlend > 0.0f) return;
+
+  if (gNextSpaceFxMode == SPACE_FX_WARM_REVERB) resetReverbState();
+  resetEchoLoopPlayback();
+  if (gSpaceFxMode == SPACE_FX_MIETTES || gNextSpaceFxMode == SPACE_FX_MIETTES) {
+    GranularFx::reset();
+  }
+  gSpaceFxMode = gNextSpaceFxMode;
+}
+
 static void rememberEchoLoopNoteStart() {
   gEchoLoopNoteStarts[gEchoLoopNoteWrite] = gEchoLoopSampleCounter;
   gEchoLoopNoteWrite = (uint8_t)((gEchoLoopNoteWrite + 1u) % ECHOLOOP_NOTE_HISTORY);
@@ -1069,12 +1113,13 @@ static int allocateVoice() {
 
   for (uint8_t i = 0; i < MAX_VOICES; ++i) {
     if (!gVoices[i].active || gVoices[i].envState == ENV_IDLE) return i;
-    if (gVoices[i].envState == ENV_RELEASE && gVoices[i].env < quietestRelease) {
+    if (!gStealRemaining[i] && gVoices[i].envState == ENV_RELEASE && gVoices[i].env < quietestRelease) {
       quietestRelease = gVoices[i].env;
       releaseVoice = i;
     }
-    if (gVoices[i].startedAt < oldestSeq) {
-      oldestSeq = gVoices[i].startedAt;
+    uint32_t sequence = gStealRemaining[i] ? gPendingVoices[i].startedAt : gVoices[i].startedAt;
+    if (sequence < oldestSeq) {
+      oldestSeq = sequence;
       oldest = i;
     }
   }
@@ -1436,11 +1481,13 @@ static float processReverb(float x) {
 
 // Aggressive distortion with fixed output compensation before the final limiter.
 static float processDrive(float x) {
+  static_assert(DRIVE_OUTPUT_GAIN >= 0.0f && DRIVE_OUTPUT_GAIN <= 1.0f,
+                "DRIVE_OUTPUT_GAIN must be 0..1");
   float input = finiteOrZero(x);
   float stageA = fastTanh(input * 8.5f);
   float stageB = fastTanh((stageA * 1.55f + input * 0.42f) * 2.7f);
   float out = stageB * 0.52f + stageA * 0.11f + input * 0.05f;
-  return clampf(finiteOrZero(out), -0.72f, 0.72f);
+  return clampf(finiteOrZero(out), -0.72f, 0.72f) * DRIVE_OUTPUT_GAIN;
 }
 
 // Random micro-loop echo from recent audio note starts and short history grains.
@@ -1479,17 +1526,31 @@ static float processEchoLoop(float x) {
 static float processSpaceFx(float x) {
   writeEchoLoopHistory(x);
 
+  float effected = x;
   switch (gSpaceFxMode) {
     case SPACE_FX_WARM_REVERB:
-      return processReverb(x);
+      effected = processReverb(x);
+      break;
     case SPACE_FX_DRIVE:
-      return processDrive(x);
+      effected = processDrive(x);
+      break;
     case SPACE_FX_ECHOLOOP:
-      return processEchoLoop(x);
+      effected = processEchoLoop(x);
+      break;
+    case SPACE_FX_MIETTES:
+      effected = GranularFx::process(x);
+      break;
     case SPACE_FX_OFF:
     default:
       return x;
   }
+  float target = (gNextSpaceFxMode == gSpaceFxMode) ? 1.0f : 0.0f;
+  if (gSpaceFxBlend < target) {
+    gSpaceFxBlend = clamp01(gSpaceFxBlend + SPACE_FX_BLEND_STEP);
+  } else if (gSpaceFxBlend > target) {
+    gSpaceFxBlend = clamp01(gSpaceFxBlend - SPACE_FX_BLEND_STEP);
+  }
+  return x + (effected - x) * gSpaceFxBlend;
 }
 
 // Final soft limiter before converting to 16-bit PCM.
@@ -1554,7 +1615,9 @@ static void renderChunk() {
     polyTrim = 1.0f / sqrtf((float)activeCount);
   }
 
+  static float smoothedPolyTrim = 1.0f;
   for (size_t i = 0; i < CHUNK_SAMPLES; ++i) {
+    smoothedPolyTrim += (polyTrim - smoothedPolyTrim) * (1.0f / 441.0f);
     float mix = 0.0f;
     if (gSamplerMode) {
       for (uint8_t v = 0; v < MAX_SAMPLE_VOICES; ++v) {
@@ -1564,10 +1627,21 @@ static void renderChunk() {
     } else {
       for (uint8_t v = 0; v < MAX_VOICES; ++v) {
         if (!gVoices[v].active) continue;
-        mix += renderVoice(gVoices[v]);
+        float sample = renderVoice(gVoices[v]);
+        if (gStealRemaining[v]) {
+          // Raised-cosine fade reaches silence before reusing this DSP slot.
+          float progress = (float)(STEAL_SAMPLES - gStealRemaining[v] + 1u) / STEAL_SAMPLES;
+          sample *= 0.5f + 0.5f * sine01(0.25f + 0.5f * progress);
+          if (--gStealRemaining[v] == 0 || !gVoices[v].active) {
+            gVoices[v] = gPendingVoices[v];
+            clearVoice(gPendingVoices[v]);
+            gStealRemaining[v] = 0;
+          }
+        }
+        mix += sample;
       }
     }
-    mix *= polyTrim;
+    mix *= smoothedPolyTrim;
     mix = softLimit(mix);
     mix = processSpaceFx(mix);
     mix = softLimit(mix * gVolume);
@@ -1608,13 +1682,19 @@ static void releaseQueuedSample(uint8_t noteIndex) {
 // Start a note on the current engine. Called only by the audio task.
 static void startQueuedNote(uint8_t noteIndex) {
   if (noteIndex >= MAX_NOTE_INDEX) return;
+  if (gSpaceFxMode == SPACE_FX_MIETTES) GranularFx::noteOn();
   if (gSamplerMode) {
     startQueuedSample(noteIndex);
     return;
   }
   rememberEchoLoopNoteStart();
   int slot = allocateVoice();
-  configureVoice(gVoices[slot], noteIndex);
+  if (gVoices[slot].active) {
+    configureVoice(gPendingVoices[slot], noteIndex);
+    if (!gStealRemaining[slot]) gStealRemaining[slot] = STEAL_SAMPLES;
+  } else {
+    configureVoice(gVoices[slot], noteIndex);
+  }
 }
 
 // Release every active voice that belongs to this pad. Called only by the audio task.
@@ -1624,6 +1704,9 @@ static void releaseQueuedNote(uint8_t noteIndex) {
     return;
   }
   for (uint8_t i = 0; i < MAX_VOICES; ++i) {
+    if (gPendingVoices[i].active && gPendingVoices[i].noteIndex == noteIndex) {
+      startRelease(gPendingVoices[i]);
+    }
     if (gVoices[i].active && gVoices[i].noteIndex == noteIndex) {
       startRelease(gVoices[i]);
     }
@@ -1710,6 +1793,22 @@ void init() {
 
   resetReverbState();
   resetEchoLoopHistory();
+  static_assert(MIETTES_MIX >= 0.0f && MIETTES_MIX <= 1.0f, "MIETTES_MIX must be 0..1");
+  static_assert(MIETTES_FEEDBACK >= 0.0f && MIETTES_FEEDBACK <= 0.65f,
+                "MIETTES_FEEDBACK must be 0..0.65");
+  static_assert(MIETTES_BPM >= 40 && MIETTES_BPM <= 240, "MIETTES_BPM must be 40..240");
+  static_assert(MIETTES_PITCH_RANDOM >= 0.0f && MIETTES_PITCH_RANDOM <= 1.0f,
+                "MIETTES_PITCH_RANDOM must be 0..1");
+  static_assert(MIETTES_TIME_RANDOM >= 0.0f && MIETTES_TIME_RANDOM <= 1.0f,
+                "MIETTES_TIME_RANDOM must be 0..1");
+  GranularFx::configure(MIETTES_MIX, MIETTES_FEEDBACK, MIETTES_BPM,
+                       MIETTES_PITCH_RANDOM, MIETTES_TIME_RANDOM);
+  GranularFx::setRandomSeed(micros());
+  GranularFx::reset();
+  gSpaceFxMode = SPACE_FX_OFF;
+  gNextSpaceFxMode = SPACE_FX_OFF;
+  gSpaceFxBlend = 0.0f;
+  gSpaceFxModeRequested.store(SPACE_FX_OFF, std::memory_order_relaxed);
   i2sInit();
   Serial.println("[Audio] engine ready");
 }
@@ -1721,8 +1820,21 @@ void update() {
     return;
   }
 
+  uint32_t renderStartUs = AUDIO_REPORT_RENDER_LOAD ? micros() : 0;
+  serviceSpaceFxRequest();
   processAudioEvents();
   renderChunk();
+  if (AUDIO_REPORT_RENDER_LOAD) {
+    static uint32_t peakUs = 0;
+    static uint16_t measuredBlocks = 0;
+    uint32_t elapsedUs = micros() - renderStartUs;
+    if (elapsedUs > peakUs) peakUs = elapsedUs;
+    if (++measuredBlocks == 1024) {
+      gRenderPeakUs.store(peakUs, std::memory_order_relaxed);
+      measuredBlocks = 0;
+      peakUs = 0;
+    }
+  }
   size_t written = 0;
   const size_t expected = sizeof(gOut);
   esp_err_t err = i2s_write(I2S_NUM_0, (const char*)gOut, expected,
@@ -1735,6 +1847,16 @@ void update() {
 
 // Reserved low-priority service hook.
 void service() {
+  if (AUDIO_REPORT_RENDER_LOAD) {
+    static uint32_t lastReportMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - lastReportMs >= 3000u) {
+      lastReportMs = nowMs;
+      Serial.printf("[Audio] DSP peak=%lu us, block budget=%lu us\n",
+                    (unsigned long)gRenderPeakUs.load(std::memory_order_relaxed),
+                    (unsigned long)(CHUNK_SAMPLES * 1000000u / SAMPLE_RATE));
+    }
+  }
   if (gSampleStorageReady) return;
 
   uint32_t nowMs = millis();
@@ -1815,36 +1937,37 @@ bool computeAllowsOscillatorEngine(OscillatorEngine engine) {
 // Select the active space effect.
 void setSpaceFxMode(SpaceFxMode mode) {
   if (mode >= SPACE_FX_COUNT) mode = SPACE_FX_OFF;
-  if (mode == gSpaceFxMode) return;
-
-  if (mode == SPACE_FX_WARM_REVERB) {
-    resetReverbState();
-  }
-  resetEchoLoopPlayback();
-  gSpaceFxMode = mode;
+  gSpaceFxModeRequested.store(mode, std::memory_order_relaxed);
 }
 
 // Return the active space effect.
 SpaceFxMode getSpaceFxMode() {
-  return gSpaceFxMode;
+  return gSpaceFxModeRequested.load(std::memory_order_relaxed);
 }
 
 // Set warm reverb depth.
 void setReverbAmount(float amount) {
-  gReverbAmount = clamp01(amount);
+  gReverbAmountRequested.store(clamp01(amount), std::memory_order_relaxed);
 }
 
 // Return warm reverb depth.
 float getReverbAmount() {
-  return gReverbAmount;
+  return gReverbAmountRequested.load(std::memory_order_relaxed);
 }
 
-// Reset all effects to a dry state.
+// Fade all effects to dry; keep their settings until the audio task finishes.
 void clearAllEffects() {
-  gSpaceFxMode = SPACE_FX_OFF;
-  gReverbAmount = 0.0f;
-  resetReverbState();
-  resetEchoLoopPlayback();
+  setSpaceFxMode(SPACE_FX_OFF);
+}
+
+// Move to the next distinct pitch class, preserving mode and base octave.
+void nudgeScale(int direction) {
+  if (!direction) return;
+  gScaleRootIndex = (gScaleRootIndex + (direction > 0 ? 1 : SCALE_ROOT_COUNT - 1)) % SCALE_ROOT_COUNT;
+  int octave = gScaleBaseMidiNote / 12 - 1;
+  gScaleBaseMidiNote = (octave + 1) * 12 + SCALE_ROOTS[gScaleRootIndex].semitone;
+  Serial.printf("[Audio] scale %s%s%d\n", gScaleMinor ? "min" : "maj",
+                SCALE_ROOTS[gScaleRootIndex].name, octave);
 }
 
 // Shift the pad map by whole octaves.

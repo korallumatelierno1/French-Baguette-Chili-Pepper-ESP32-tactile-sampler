@@ -133,7 +133,7 @@ namespace Input {
   static uint32_t gIrqFallbackLastMs = 0;
   static uint32_t gIrqMissLogMs = 0;
 
-  static uint8_t  gFxStage = 0; // 0: off, 1: reverb, 2: drive, 3: echoloop.
+  static uint8_t  gFxStage = 0; // Off, reverb, drive, echoloop, Miettes.
   static int      gCurrentEngineIndex = 3;
 
   // Control pads are filtered so one strong control press does not trigger neighbors.
@@ -141,6 +141,7 @@ namespace Input {
   static uint8_t  gDominantControlPad = NO_CONTROL_PAD;
   static bool     gEnginePadPressed = false;
   static bool     gSampleModeComboHeld = false;
+  static uint32_t gScaleComboHeldMask = 0;
   static bool     gPendingOctaveActive = false;
   static uint8_t  gPendingOctavePad = NO_CONTROL_PAD;
   static PadAction gPendingOctaveAction = ACTION_NONE;
@@ -340,11 +341,10 @@ namespace Input {
 
   // Apply one of the headless FX states.
   static void applyHeadlessFxStage(uint8_t stage) {
-    Audio::clearAllEffects();
     switch (stage) {
       case 1:
-        Audio::setSpaceFxMode(Audio::SPACE_FX_WARM_REVERB);
         Audio::setReverbAmount(0.78f);
+        Audio::setSpaceFxMode(Audio::SPACE_FX_WARM_REVERB);
         UI::showToast("FX: Reverb");
         break;
       case 2:
@@ -355,15 +355,20 @@ namespace Input {
         Audio::setSpaceFxMode(Audio::SPACE_FX_ECHOLOOP);
         UI::showToast("FX: echoloop");
         break;
+      case 4:
+        Audio::setSpaceFxMode(Audio::SPACE_FX_MIETTES);
+        UI::showToast("FX: Miettes");
+        break;
       default:
+        Audio::setSpaceFxMode(Audio::SPACE_FX_OFF);
         UI::showToast("FX: Off");
         break;
     }
   }
 
-  // Cycle through off, reverb, drive, and echoloop.
+  // Cycle through off, reverb, drive, echoloop, and Miettes.
   static void cycleFxPad() {
-    gFxStage = (uint8_t)((gFxStage + 1u) % 4u);
+    gFxStage = (uint8_t)((gFxStage + 1u) % Audio::SPACE_FX_COUNT);
     applyHeadlessFxStage(gFxStage);
   }
 
@@ -411,7 +416,8 @@ namespace Input {
   }
 
   static inline bool isOctaveAction(PadAction action) {
-    return action == ACTION_OCTAVE_DOWN || action == ACTION_OCTAVE_UP;
+    return action == ACTION_OCTAVE_DOWN || action == ACTION_OCTAVE_UP ||
+           action == ACTION_VOLUME_DOWN || action == ACTION_VOLUME_UP;
   }
 
   static void clearPendingOctave() {
@@ -435,6 +441,27 @@ namespace Input {
 
     handleControlPress(gPendingOctavePad, gPendingOctaveAction, nowMs);
     clearPendingOctave();
+  }
+
+  // Eiffel + cloud/flower: consume both controls until both are released.
+  static uint32_t processScaleCombo(uint32_t touchMask) {
+    if (gScaleComboHeldMask) {
+      uint32_t mask = gScaleComboHeldMask;
+      if (!(touchMask & mask)) gScaleComboHeldMask = 0;
+      return touchMask & ~mask;
+    }
+    if (Audio::isSamplerMode() || gSampleModeComboHeld) return touchMask;
+    const uint32_t cloud = 1u << PAD_VOLUME_DOWN;
+    const uint32_t flower = 1u << PAD_VOLUME_UP;
+    if ((touchMask & OCTAVE_DOWN_PAD_BIT) && (touchMask & (cloud | flower))) {
+      clearPendingOctave();
+      gScaleComboHeldMask = OCTAVE_DOWN_PAD_BIT | (touchMask & (cloud | flower));
+      if ((touchMask & (cloud | flower)) != (cloud | flower)) {
+        Audio::nudgeScale((touchMask & flower) ? 1 : -1);
+      }
+      return touchMask & ~gScaleComboHeldMask;
+    }
+    return touchMask;
   }
 
   static uint32_t processSampleModeCombo(uint32_t touchMask) {
@@ -519,6 +546,7 @@ namespace Input {
     gDominantControlPad = NO_CONTROL_PAD;
     gEnginePadPressed = false;
     gSampleModeComboHeld = false;
+    gScaleComboHeldMask = 0;
     clearPendingOctave();
   }
 
@@ -592,6 +620,7 @@ namespace Input {
     }
 
     // Resolve the two-pad sampler combo before control-pad ambiguity filtering.
+    tFiltered = processScaleCombo(tFiltered);
     tFiltered = processSampleModeCombo(tFiltered);
 
     // Resolve control-pad ambiguity before computing edges.
